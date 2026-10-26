@@ -1,0 +1,1553 @@
+---
+title: "[EM1413] - Health Data Science"
+subtitle: "MEPS healthcare access and disparities analysis"
+author: "Alessia Berruti, Noemi Gambini, Irene Romani"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    theme: flatly
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    code_folding: show
+    highlight: tango
+  pdf_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 10,
+  fig.height = 6,
+  fig.align = "center"
+)
+```
+
+# Problem Definition
+
+In this project, we aim to investigate the existence of a systematic association between socio-economic determinants, specifically insurance coverage and income levels, and the actual accessibility of healthcare services. We seek to determine if structural barriers create a condition of "hidden exclusion," in which individuals with greater healthcare needs may experience reduced access to healthcare services despite their clinical needs.
+
+
+# Abstract
+
+After inspecting the Medical Expenditure Panel Survey (MEPS) dataset and understanding its nature, we decided to examine whether unequal access to care makes a measurable impact on healthcare utilization and health management across the U.S. population. Furthermore, we attempted to identify which demographic and economic sections face the strongest barriers and how these barriers suppress the utilization of essential services.
+
+The first part of our analysis is dedicated to data cleaning and exploration. We handled MEPS-specific non-response codes, treated them as missing values, and dropped observations that lacked significance for our research scope. We also transformed continuous variables into categorical ones to allow for a more informative interpretation of socio-economic disparities.
+
+Data visualization is focused on our main elements of interest: insurance status, income, and access barriers. Furthermore, we performed exploratory analysis by observing the geographical distribution of indicators across regions to detect potential spatial disparities.
+
+We propose three core statistical models to validate our hypotheses: a Logistic Regression to identify the predictors of access barriers, a Negative Binomial Regression to analyze healthcare utilization, and a Generalized Linear Mixed Model (GLMM) to investigate whether geographic context or insurance clustering adds explanatory power beyond individual characteristics.
+
+
+# Setup and Data Loading
+
+The analysis begins with the configuration of the R environment; once the necessary libraries have been loaded, we proceed to upload and prepare the Medical Expenditure Panel Survey (MEPS HC-216) dataset, that is a comprehensive public health survey designed to collect data on the cost and use of healthcare and health insurance coverage across the United States.
+
+MEPS uses a complex, multistage probability sampling design. Each respondent carries a sampling weight (`PERWT19F`) representing the number of U.S. civilians they represent in the population. Two additional variables, `VARSTR` (stratum) and `VARPSU` (primary sampling unit), are required for correct variance estimation. In the Exploratory Data Analysis section that follows, we use the `survey` package to produce population-representative estimates. For the regression models (Logistic, Negative Binomial, and GLMM), design-based inference is limited by software constraints. However, we verify that normalized weights are not significant predictors when included as fixed effects. Therefore, unweighted models yield essentially equivalent population-level inference.
+
+```{r libraries}
+library(tidyverse)
+library(dplyr)
+library(ggplot2)
+library(gridExtra)
+library(kableExtra)
+library(knitr)
+library(skimr)
+library(corrplot)
+library(scales)
+library(haven)
+library(survey)
+library(lme4) # GLMM
+library(MASS) # glm.nb
+library(AER) # dispersiontest
+library(lmtest) # lrtest
+library(pROC) # ROC / AUC
+library(sjPlot) # plot_model
+library(parameters) # random_parameters
+library(MuMIn) # r.squaredGLMM
+library(broom.mixed) # tidy for mixed models
+library(ggeffects) # marginal effects
+
+meps_raw <- read_dta("h216.dta")
+```
+
+```{r data_overview, echo=FALSE}
+cat("Raw dataset dimensions: ", nrow(meps_raw), " observations and ", ncol(meps_raw), " variables\n")
+```
+
+
+## Data Cleaning and Variable Construction
+
+```{r data_clean}
+meps <- meps_raw
+
+# Handle MEPS negative codes
+meps[meps == -1 | meps == -7 | meps == -8 | meps == -9] <- NA
+
+# Demographics
+meps$age <- meps$AGE19X
+meps$age_group <- cut(meps$age,
+                      breaks = c(0, 17, 34, 49, 64, Inf),
+                      labels = c("0-17", "18-34", "35-49", "50-64", "65+"))
+meps$sex <- factor(meps$SEX, levels = 1:2, labels = c("Male", "Female"))
+meps$race_eth <- case_when(
+  meps$HISPANX == 1 ~ "Hispanic",
+  meps$RACEV1X == 1 & meps$HISPANX == 2 ~ "White Non-Hispanic",
+  meps$RACEV1X == 2 & meps$HISPANX == 2 ~ "Black Non-Hispanic",
+  meps$RACEV1X == 3 & meps$HISPANX == 2 ~ "Asian Non-Hispanic",
+  TRUE ~ "Other/Mixed") %>% 
+  factor(levels = c("White Non-Hispanic", "Black Non-Hispanic", "Hispanic",
+                    "Asian Non-Hispanic", "Other/Mixed"))
+
+meps$educ_yrs <- meps$EDUCYR
+meps$educ_cat <- cut(meps$educ_yrs,
+                     breaks = c(-Inf, 8, 11, 12, 15, Inf),
+                     labels = c("< Some HS", "Some HS", "HS Grad", "Some College", "College+"))
+meps$marital <- factor(meps$MARRY19X, levels = 1:5, labels = c("Married", "Widowed",
+                                                               "Divorced", "Separated",
+                                                               "Never Married"))
+
+# Insurance and Income
+meps$ins_status <- factor(meps$INSCOV19, levels = 1:3, labels = c("Any Private", "Public Only", 
+                                                                  "Uninsured"))
+meps$medicaid <- factor(meps$MCAID19X, levels = 1:2, labels = c("Yes", "No"))
+meps$medicare <- factor(meps$MCARE19X, levels = 1:2, labels = c("Yes", "No"))
+meps$uninsured <- ifelse(meps$ins_status == "Uninsured", 1, 0)
+
+meps$povcat <- factor(meps$POVCAT19, levels = 1:5, 
+                      labels = c("Poor (<100% FPL)","Near Poor (100-124%)",
+                                 "Low Income (125-199%)", "Middle Income (200-399%)", 
+                                 "High Income (400%+)"))
+meps$low_income <- ifelse(meps$POVCAT19 %in% c(1, 2, 3), 1, 0)
+
+# Health status and chronic conditions
+meps$health_gen <- factor(meps$RTHLTH53, levels = 1:5, labels = c("Excellent", "Very Good",
+                                                                  "Good", "Fair", "Poor"))
+meps$health_ment <- factor(meps$MNHLTH53, levels = 1:5, labels = c("Excellent", "Very Good",
+                                                                   "Good", "Fair", "Poor"))
+meps$poor_health <- ifelse(meps$RTHLTH53 %in% c(4, 5), 1, 0)
+
+meps$hypertension <- ifelse(meps$HIBPDX == 1, 1, 0)
+meps$diabetes <- ifelse(meps$DIABDX_M18 == 1, 1, 0)
+meps$heart_dis <- ifelse(meps$CHDDX == 1, 1, 0)
+meps$high_chol <- ifelse(meps$CHOLDX == 1, 1, 0)
+meps$arthritis <- ifelse(meps$ARTHDX == 1, 1, 0)
+meps$n_chronic <- rowSums(meps[, c("hypertension", "diabetes", "heart_dis", "high_chol",
+                                   "arthritis")], na.rm = TRUE)
+meps$any_chronic <- ifelse(meps$n_chronic > 0, 1, 0)
+
+# Access barriers and utilization
+meps$delayed_care <- ifelse(meps$DLAYCA42 == 1, 1, 0)
+meps$unafford_care <- ifelse(meps$AFRDCA42 == 1, 1, 0)
+meps$delayed_dental<- ifelse(meps$DLAYDN42 == 1, 1, 0)
+meps$any_barrier <- ifelse(meps$delayed_care == 1 | meps$unafford_care == 1, 1, 0)
+
+meps$office_visits <- meps$OBTOTV19
+meps$er_visits <- meps$ERTOT19
+meps$ip_stays <- meps$IPDIS19
+meps$total_visits <- meps$office_visits + meps$er_visits
+meps$total_exp <- meps$TOTEXP19
+meps$oop_exp <- meps$TOTSLF19
+
+meps$region <- factor(meps$REGION19, levels = 1:4, labels = c("Northeast", "Midwest", "South",
+                                                              "West"))
+
+# Survey design variables
+meps$perwt  <- meps$PERWT19F
+meps$varstr <- meps$VARSTR
+meps$varpsu <- meps$VARPSU
+
+# Restrict to adults
+meps_adults <- meps %>%
+  filter(age >= 18) %>%
+  drop_na(sex, age_group, ins_status, povcat, race_eth, health_gen, office_visits, delayed_care,
+          any_barrier, perwt, varstr, varpsu)
+
+# Normalized weights
+meps_adults$perwt_norm <- meps_adults$perwt / mean(meps_adults$perwt)
+```
+
+```{r data_summary, echo=FALSE}
+cat("Adults in final dataset:", nrow(meps_adults), "\n")
+cat("Represented US population (weighted N):",
+    format(round(sum(meps_adults$perwt)), big.mark = ","), "\n")
+```
+ 
+```{r survey_design}
+options(survey.lonely.psu = "adjust")
+
+meps_svy <- svydesign(ids = ~varpsu, strata = ~varstr, weights = ~perwt, data = meps_adults,
+                      nest = TRUE)
+```
+
+---
+
+# Exploratory Data Analysis
+
+## Age Distribution
+
+```{r eda_age, fig.width=8, fig.height=4.5, echo=FALSE}
+wtd_age_mean <- as.numeric(svymean(~age, meps_svy))
+
+ggplot(meps_adults, aes(x = age)) +
+  geom_histogram(binwidth = 5, fill = "#2C7BB6", color = "white") +
+  geom_vline(xintercept = wtd_age_mean, color = "red", linetype = "dashed", size = 1) +
+  annotate("text", x = wtd_age_mean + 4, y = Inf, 
+           label = paste0("Wtd Mean = ", round(wtd_age_mean, 1)),
+           vjust = 2, color = "red", size = 3.8) +
+  labs(title = "Age Distribution of the Adult Sample",
+       x = "Age", y = "Frequency") +
+  theme_minimal()
+```
+
+The age distribution of the adult sample is relatively flat across the working-age population, with a weighted mean of `r round(wtd_age_mean, 1)` years. The distribution shows a moderate concentration between ages 45 and 70. 
+
+
+## Insurance Coverage
+
+```{r eda_insurance, fig.width=8, fig.height=3.5, echo=FALSE}
+ins_wtd <- svymean(~ins_status, meps_svy) %>%
+  as.data.frame() %>%
+  rownames_to_column("ins_status") %>%
+  mutate(ins_status = gsub("ins_status", "", ins_status),
+         pct = mean * 100)
+
+ggplot(ins_wtd, aes(x = reorder(ins_status, pct), y = pct, fill = ins_status)) +
+  geom_col(show.legend = FALSE) +
+  coord_flip() +
+  scale_fill_brewer(palette = "Set2") +
+  labs(title = "Type of Coverage",
+       x = "", y = "%") +
+  theme_minimal()
+```
+
+Insurance coverage in the U.S. adult population is dominated by private plans, which cover approximately `r round(ins_wtd$pct[ins_wtd$ins_status == "Any Private"], 1)`% of adults. Public-only coverage accounts for roughly `r round(ins_wtd$pct[ins_wtd$ins_status == "Public Only"], 1)`%, while the uninsured represent approximately `r round(ins_wtd$pct[ins_wtd$ins_status == "Uninsured"], 1)`% of the adult population. Although the uninsured share is the smallest of the three groups, it represents a non-trivial segment of the population.
+
+
+## Income Distribution
+
+```{r eda_income, fig.width=8, fig.height=4.5, echo=FALSE}
+pov_wtd <- svymean(~povcat, meps_svy) %>%
+  as.data.frame() %>%
+  rownames_to_column("povcat") %>%
+  mutate(povcat = gsub("povcat", "", povcat),
+         pct = mean * 100)
+
+ggplot(pov_wtd, aes(x = povcat, y = pct, fill = povcat)) +
+  geom_col(show.legend = FALSE) +
+  coord_flip() +
+  scale_fill_brewer(palette = "RdYlGn") +
+  labs(title = "Income Category (% Federal Poverty Level)",
+       x = "", y = "%") +
+  theme_minimal()
+```
+
+The income distribution reveals a pronounced skew toward higher income categories: over `r round(pov_wtd$pct[grepl("400", pov_wtd$povcat)], 0)`% of adults fall in the High Income bracket, while the combined low-income population — those below 200% FPL — accounts for approximately `r round(sum(pov_wtd$pct[pov_wtd$povcat %in% c("Poor (<100% FPL)", "Near Poor (100-124%)", "Low Income (125-199%)")]), 0)`% of the sample. The near-poor category is the smallest group, representing less than 3% of adults. 
+
+
+## Racial and Ethnic Diversity
+
+```{r eda_race, fig.width=8, fig.height=4.5, echo=FALSE}
+race_wtd <- svymean(~race_eth, meps_svy) %>%
+  as.data.frame() %>%
+  rownames_to_column("race_eth") %>%
+  mutate(race_eth = gsub("race_eth", "", race_eth),
+         pct = mean * 100)
+
+ggplot(race_wtd, aes(x = reorder(race_eth, pct), y = pct, fill = race_eth)) +
+  geom_col(show.legend = FALSE) +
+  coord_flip() +
+  scale_fill_brewer(palette = "Set1") +
+  labs(title = "Racial and Ethnic Composition",
+       x = "", y = "%") +
+  theme_minimal()
+```
+
+The sample exhibits a diverse racial and ethnic composition, with White Non-Hispanic adults constituting the clear majority at approximately `r round(race_wtd$pct[race_wtd$race_eth == "White Non-Hispanic"], 0)`%, followed by Hispanic (`r round(race_wtd$pct[race_wtd$race_eth == "Hispanic"], 0)`%) and Black Non-Hispanic (`r round(race_wtd$pct[race_wtd$race_eth == "Black Non-Hispanic"], 0)`%) adults. Asian Non-Hispanic respondents represent a small share.
+
+
+## Gender Disparities
+
+Having described the overall composition of the sample, we now examine whether sex is associated with differential patterns of healthcare access and utilization. 
+```{r eda_gender_table}
+gender_tbl <- svyby(
+  ~any_barrier + delayed_care + unafford_care + office_visits +
+    er_visits + poor_health + any_chronic + uninsured,
+  ~sex, meps_svy, svymean, na.rm = TRUE
+) %>%
+  as.data.frame() %>%
+  mutate(
+    `% Any Barrier`    = round(any_barrier   * 100, 1),
+    `% Delayed Care`   = round(delayed_care  * 100, 1),
+    `% Unafford. Care` = round(unafford_care * 100, 1),
+    `Avg Office Visits`= round(office_visits, 2),
+    `Avg ER Visits`    = round(er_visits, 2),
+    `% Poor Health`    = round(poor_health   * 100, 1),
+    `% Any Chronic`    = round(any_chronic   * 100, 1),
+    `% Uninsured`      = round(uninsured     * 100, 1)
+  ) %>%
+  dplyr::select(sex, `% Any Barrier`, `% Delayed Care`, `% Unafford. Care`,
+                `Avg Office Visits`, `Avg ER Visits`,
+                `% Poor Health`, `% Any Chronic`, `% Uninsured`)
+
+knitr::kable(gender_tbl,
+             caption = "Weighted Access and Utilization Indicators by Gender") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"))
+```
+
+The share of women who experienced any barrier to care exceeds that of men, with delays in care and affordability concerns both more prevalent among female respondents. 
+At the same time, women record a higher average number of office visits, suggesting that while they face more barriers, they also engage more actively with the healthcare system when access is available. 
+However, this indicates that women have greater clinical needs, which drive utilization upward even in the presence of structural obstacles
+
+```{r eda_gender_insurance, fig.width=8, fig.height=4.5}
+gender_ins_barrier <- svyby(~any_barrier, ~sex + ins_status, meps_svy,
+                              svymean, na.rm = TRUE) %>%
+  as.data.frame() %>%
+  mutate(pct_barrier = any_barrier * 100)
+
+ggplot(gender_ins_barrier,
+       aes(x = ins_status, y = pct_barrier, fill = sex)) +
+  geom_col(position = "dodge") +
+  scale_fill_manual(values = c("Male" = "#4575B4", "Female" = "#D73027"),
+                    name = "Sex") +
+  labs(title = "Access Barriers by Gender and Insurance Status",
+       x = "Insurance Status", y = "% with Any Barrier") +
+  theme_minimal()
+```
+
+When access barriers are examined jointly by gender and insurance status, a consistent pattern emerges: women report higher barrier rates than men within every insurance category. 
+The gap is most pronounced among the uninsured, where both sexes face the highest absolute barrier rates. Among privately insured individuals — the reference group with the best coverage — the female excess in barriers remains visible, suggesting that gender-related disparities in access are not fully explained by insurance coverage alone.
+
+```{r gender_significance, echo=FALSE}
+svychisq_any   <- svychisq(~sex + any_barrier,  meps_svy, statistic = "F")
+svychisq_delay <- svychisq(~sex + delayed_care, meps_svy, statistic = "F")
+svyttest_vis   <- svyttest(office_visits ~ sex, meps_svy)
+
+sig_summary <- data.frame(
+  Variable  = c("Any Barrier", "Delayed Care", "Office Visits"),
+  Test      = c("Chi-Square", "Chi-Square", "T-Test"),
+  Statistic = round(c(svychisq_any$statistic, svychisq_delay$statistic,
+                       svyttest_vis$statistic), 3),
+  P_Value   = c(svychisq_any$p.value, svychisq_delay$p.value, svyttest_vis$p.value)
+) %>%
+  mutate(Significance = case_when(
+    P_Value < 0.001 ~ "*** (p < 0.001)",
+    P_Value < 0.01  ~ "** (p < 0.01)",
+    P_Value < 0.05  ~ "* (p < 0.05)",
+    TRUE            ~ "n.s."
+  ))
+
+knitr::kable(sig_summary, digits = 4,
+             caption = " Significance Tests") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+```
+To confirm that these patterns are not due to sampling variability,significance tests were conducted. The chi-square test for any access barrier (p < 0.001) and for delayed care (p < 0.001) both indicate highly significant gender differences. The t-test for office visit counts (t = 12.07, p < 0.001) confirms that the utilization gap between women and men is statistically robust after accounting for the stratified sampling design.
+
+
+## Health Status and Chronic Conditions
+
+```{r eda_health_status, fig.width=8, fig.height=4.5}
+health_wtd <- svymean(~health_gen, meps_svy, na.rm = TRUE) %>%
+  as.data.frame() %>%
+  rownames_to_column("health_gen") %>%
+  mutate(health_gen = gsub("health_gen", "", health_gen),
+         pct = mean * 100,
+         health_gen = factor(health_gen,
+                              levels = c("Excellent", "Very Good", "Good",
+                                         "Fair", "Poor")))
+
+ggplot(health_wtd, aes(x = health_gen, y = pct, fill = health_gen)) +
+  geom_col(show.legend = FALSE) +
+  scale_fill_manual(values = c("Excellent"  = "#1a9641", "Very Good" = "#a6d96a", "Good"      = "#ffffbf",
+                                "Fair"      = "#fdae61", "Poor"      = "#d7191c")) +
+  labs(title = "Self-Rated General Health Status",x = "Health Status", y = "%") +
+  theme_minimal()
+```
+
+The self-rated health distribution is left-skewed in a favorable direction: the majority of U.S. adults rate their health as Very Good or Good, while only about 7% report Fair or Poor health. 
+
+```{r eda_age_health, fig.width=8, fig.height=4.5}
+meps_adults %>%
+  filter(!is.na(health_gen)) %>%
+  mutate(health_gen = factor(health_gen,
+                              levels = c("Excellent", "Very Good", "Good",
+                                         "Fair", "Poor"))) %>%
+  ggplot(aes(x = health_gen, y = age, fill = health_gen)) +
+  geom_boxplot(outlier.alpha = 0.2) +
+  scale_fill_manual(values = c("Excellent"  = "#1a9641","Very Good" = "#a6d96a","Good" = "#ffffbf",
+                                "Fair"      = "#fdae61","Poor"      = "#d7191c")) +
+  labs(title = "Age Distribution by Self-Rated Health Status",
+       x = "Health Status", y = "Age") +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+The relationship between age and self-rated health is clearly visible: the median age rises progressively as health status worsens, from approximately 40 years among those reporting Excellent health to over 60 among those in Poor health. This gradient confirms that age is a strong confounding variable in health status analyses and justifies its inclusion as a covariate in all subsequent models.
+
+```{r eda_chronic_prev, fig.width=8, fig.height=4.5}
+chronic_vars   <- c("hypertension", "high_chol", "arthritis", "diabetes", "heart_dis")
+chronic_labels <- c("Hypertension", "High Cholesterol", "Arthritis",
+                    "Diabetes", "Heart Disease")
+
+chronic_prev <- svymean(reformulate(chronic_vars), meps_svy, na.rm = TRUE) %>%
+  as.data.frame() %>%
+  rownames_to_column("Condition") %>%
+  mutate(Condition  = chronic_labels,
+         Prevalence = mean * 100)
+
+ggplot(chronic_prev,
+       aes(x = reorder(Condition, Prevalence), y = Prevalence, fill = Condition)) +
+  geom_col(show.legend = FALSE) +
+  coord_flip() +
+  scale_fill_brewer(palette = "Blues") +
+  labs(title = "Chronic Condition Prevalence",
+       x = "", y = "%") +
+  theme_minimal()
+```
+
+Hypertension is the most prevalent chronic condition in the adult population, affecting approximately 30% of individuals, followed by high cholesterol and arthritis. Diabetes and heart disease are less prevalent but clinically significant given their resource-intensive management requirements. These five conditions together constitute the chronic burden variable (`n_chronic`) used in subsequent regression models.
+
+```{r eda_chronic_by_age_sex, fig.width=8, fig.height=4.5}
+chronic_age_sex <- svyby(~n_chronic, ~age_group + sex,
+                          meps_svy, svymean, na.rm = TRUE) %>%
+  as.data.frame()
+
+ggplot(chronic_age_sex,
+       aes(x = age_group, y = n_chronic, color = sex, group = sex)) +
+  geom_line(size = 1.2) +
+  geom_point(size = 3) +
+  scale_color_manual(values = c("Male" = "#4575B4", "Female" = "#D73027"), name = "Sex") +
+  labs(title = "Average Number of Chronic Conditions by Age Group and Gender",
+       x = "Age Group", y = "Avg Chronic Conditions") +
+  theme_minimal()
+```
+
+The chronic disease burden rises sharply with age for both sexes, confirming that aging is the dominant driver of health needs in the sample. The average number of chronic conditions increases steadily across all age groups, exceeding two conditions per person among adults aged 65 and older. While small gender differences emerge in later life, these differences remain modest.  
+This graph is important because it explains the strong increase in healthcare utilization with age: as chronic conditions accumulate, so does the need for medical care.
+
+
+## Access Barriers by Insurance Status and Income
+
+Having established the sample characteristics and health profile, we now examine the central variable of interest: the prevalence of access barriers across structural dimensions.
+
+```{r eda_barrier_table}
+barrier_tbl <- svyby(
+  ~delayed_care + unafford_care + any_barrier,
+  ~ins_status, meps_svy, svymean, na.rm = TRUE
+) %>%
+  as.data.frame() %>%
+  transmute(
+    `Insurance Status` = ins_status,
+    `% Delayed Care`   = round(delayed_care  * 100, 1),
+    `% Cannot Afford`  = round(unafford_care * 100, 1),
+    `% Any Barrier`    = round(any_barrier   * 100, 1)
+  )
+
+knitr::kable(barrier_tbl,
+             caption = "Access Barriers by Insurance Status — Weighted (%)") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"))
+```
+The insurance status gradient in access barriers is stark. Among the uninsured, approximately one in three adults reports some form of access barrier — a rate dramatically higher than among the privately insured. Privately insured individuals have the lowest barrier rates across all three dimensions, confirming that private insurance operates as the most effective buffer against access obstacles. Publicly insured individuals occupy an intermediate position, with barrier rates above private coverage but substantially below the uninsured.
+
+Barriers in the MEPS dataset are measured by two specific variables: DLAYCA42 (did you delay or avoid seeking medical care?) and AFRDCA42 (did you forgo care because you couldn’t afford it?)
+A barrier is the moment when a clinical need encounters an obstacle and fails to result in care utilization; the person knows they needed care and knows they did not receive it, or received it too late
+
+```{r eda_rr_or, echo=FALSE}
+# Weighted conditional probabilities for RR/OR calculation
+tb_ins_wtd <- prop.table(svytable(~ins_status + any_barrier, meps_svy), 1)
+
+rr_unemp <- tb_ins_wtd["Uninsured",   "1"] / tb_ins_wtd["Any Private", "1"]
+rr_publ  <- tb_ins_wtd["Public Only", "1"] / tb_ins_wtd["Any Private", "1"]
+or_unins <- (tb_ins_wtd["Uninsured",   "1"] / tb_ins_wtd["Uninsured",   "0"]) /
+            (tb_ins_wtd["Any Private", "1"] / tb_ins_wtd["Any Private", "0"])
+or_publ  <- (tb_ins_wtd["Public Only", "1"] / tb_ins_wtd["Public Only", "0"]) /
+            (tb_ins_wtd["Any Private", "1"] / tb_ins_wtd["Any Private", "0"])
+
+rr_or_tbl <- tibble(
+  Group        = c("Public Only vs Private", "Uninsured vs Private"),
+  `Risk Ratio` = round(c(rr_publ, rr_unemp), 2),
+  `Odds Ratio` = round(c(or_publ, or_unins), 2)
+)
+
+knitr::kable(rr_or_tbl,
+             caption = "Weighted Crude Risk Ratios and Odds Ratios — Access Barrier by Insurance") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+The crude risk ratios quantify this disparity: uninsured adults are `r round(rr_unemp, 1)` times more likely to face an access barrier than privately insured adults, and their odds of encountering a barrier are `r round(or_unins, 1)` times higher. Even among the publicly insured, the risk of experiencing a barrier is `r round(rr_publ, 1)` times that of the privately insured. 
+These are **unadjusted (crude) estimates** — they do not control for age, income, health status, or other confounders. 
+
+```{r eda_barrier_ins_income, fig.width=9, fig.height=5}
+barrier_ins_pov <- svyby(~any_barrier, ~ins_status + povcat,
+                          meps_svy, svymean, na.rm = TRUE) %>%
+  as.data.frame() %>%
+  mutate(pct = any_barrier * 100)
+
+ggplot(barrier_ins_pov, aes(x = ins_status, y = pct, fill = povcat)) +
+  geom_col(position = "dodge") +
+  scale_fill_brewer(palette = "RdYlGn", name = "Income Category") +
+  labs(title = "Access Barriers by Insurance Status and Income — Weighted (%)",
+       x = "Insurance Status", y = "% with Any Barrier") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 20, hjust = 1))
+```
+
+When income is introduced as a second dimension, the pattern becomes more nuanced. Within each insurance category, lower-income individuals consistently face higher barrier rates. The steepest income gradients appear among the uninsured insured, where near-poor individuals (100–124% FPL) often report the highest barrier rates of all groups — a finding consistent with the "near-poor trap," where individuals earn too much to qualify for comprehensive Medicaid but too little to afford adequate private coverage or out-of-pocket costs.
+
+```{r eda_income_rr}
+tb_pov_wtd <- prop.table(svytable(~povcat + any_barrier, meps_svy), 1)
+
+rr_poor_hi <- tb_pov_wtd["Poor (<100% FPL)",      "1"] / tb_pov_wtd["High Income (400%+)", "1"]
+rr_near_hi <- tb_pov_wtd["Near Poor (100-124%)",  "1"] / tb_pov_wtd["High Income (400%+)", "1"]
+rr_low_hi  <- tb_pov_wtd["Low Income (125-199%)", "1"] / tb_pov_wtd["High Income (400%+)", "1"]
+
+income_rr_tbl <- tibble(
+  `Income Group`          = c("Poor (<100% FPL)", "Near Poor (100-124%)", "Low Income (125-199%)"),
+  `vs High Income (400%+)` = c(round(rr_poor_hi, 2), round(rr_near_hi, 2), round(rr_low_hi, 2))
+) %>% rename(`Risk Ratio` = `vs High Income (400%+)`)
+
+knitr::kable(income_rr_tbl,
+             caption = "Weighted Risk Ratios for Any Access Barrier vs High Income Adults") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+The income gradient in access barriers is also substantial in absolute terms. Poor adults are `r round(rr_poor_hi, 1)` times more likely to face a care barrier than high-income adults. Near-poor adults show an even higher relative risk of `r round(rr_near_hi, 1)`, reinforcing the near-poor trap hypothesis. Even low-income adults face a risk `r round(rr_low_hi, 1)` times that of their high-income counterparts.
+
+
+## Healthcare Utilization by Insurance Status
+
+```{r eda_util_boxplots, fig.width=10, fig.height=4.5}
+p_ov <- meps_adults %>%
+  filter(office_visits <= 30) %>%
+  ggplot(aes(x = ins_status, y = office_visits, fill = ins_status)) +
+  geom_boxplot(outlier.alpha = 0.3) +
+  scale_fill_brewer(palette = "Set2") +
+  labs(title = "Office Visits by Insurance Status",
+       x = "", y = "N. Visits (capped at 30)") +
+  theme_minimal() + theme(legend.position = "none")
+
+p_er <- meps_adults %>%
+  filter(er_visits <= 10) %>%
+  ggplot(aes(x = ins_status, y = er_visits, fill = ins_status)) +
+  geom_boxplot(outlier.alpha = 0.3) +
+  scale_fill_brewer(palette = "Set2") +
+  labs(title = "Emergency Department Visits by Insurance Status",
+       x = "", y = "N. Visits (capped at 10)") +
+  theme_minimal() + theme(legend.position = "none")
+
+grid.arrange(p_ov, p_er, ncol = 2)
+```
+
+```{r eda_util_wtd_means, include=FALSE}
+wtd_visits <- svyby(~office_visits + er_visits, ~ins_status,
+                     meps_svy, svymean, na.rm = TRUE)
+```
+
+The utilization patterns by insurance status reveal two contrasting dynamics. For office visits, privately insured adults show both a higher median and a wider interquartile range, reflecting greater and more variable engagement with outpatient care. Publicly insured individuals display a similar median but with a heavier right tail, consistent with the higher disease burden of the Medicaid/Medicare population. The uninsured have the lowest office visit counts — a pattern that, in conjunction with their high barrier rates, is consistent with the "hidden exclusion" hypothesis: individuals who need care the most are systematically less likely to access it.
+
+For emergency department visits, the pattern reverses: the uninsured and publicly insured show slightly higher ED utilization relative to their office visit counts, suggesting a substitution effect whereby lack of primary care access drives deferred conditions to the emergency setting.
+
+```{r eda_visits_dist, fig.width=8, fig.height=4.5}
+ggplot(meps_adults, aes(x = pmin(office_visits, 25))) +
+  geom_histogram(binwidth = 1, fill = "#4575B4", color = "white") +
+  labs(title = "Distribution of Office Visits (capped at 25)",
+       subtitle = paste0("Mean = ",
+                          round(mean(meps_adults$office_visits, na.rm=TRUE), 2),
+                          "   |   Variance = ",
+                          round(var(meps_adults$office_visits, na.rm=TRUE), 2)),
+       x = "Number of Office Visits", y = "Frequency") +
+  theme_minimal()
+```
+
+The distribution of office visits is strongly right-skewed with a large mass at zero, a mean of `r round(mean(meps_adults$office_visits, na.rm=TRUE), 2)` visits and a variance of `r round(var(meps_adults$office_visits, na.rm=TRUE), 2)`. The variance far exceeds the mean — a direct indication of overdispersion that rules out the Poisson model and motivates the use of Negative Binomial regression in Part 3 of the analysis.
+
+
+## Out-of-Pocket Expenditure
+
+```{r eda_oop_dist, fig.width=8, fig.height=4.5}
+wtd_oop <- svymean(~oop_exp, meps_svy, na.rm = TRUE)
+
+ggplot(meps_adults %>% filter(oop_exp <= 5000), aes(x = oop_exp)) +
+  geom_histogram(binwidth = 100, fill = "#d73027", color = "white", alpha = 0.7) +
+  geom_vline(xintercept = as.numeric(wtd_oop),
+             color = "navy", linetype = "dashed", size = 1) +
+  annotate("text", x = as.numeric(wtd_oop) + 350, y = Inf,
+           label = paste0("Wtd Mean = $", round(as.numeric(wtd_oop), 0)),
+           vjust = 2, color = "navy", size = 3.8) +
+  labs(title = "Distribution of Out-of-Pocket Healthcare Expenditure",
+       x = "OOP Expenditure ($)", y = "Count") +
+  theme_minimal()
+```
+
+```{r eda_oop_by_ins, fig.width=8, fig.height=4.5}
+meps_adults %>%
+  filter(oop_exp <= 5000) %>%
+  ggplot(aes(x = ins_status, y = oop_exp, fill = ins_status)) +
+  geom_violin(alpha = 0.5, trim = TRUE) +
+  geom_boxplot(width = 0.1, outlier.size = 0.5) +
+  scale_fill_brewer(palette = "Set2") +
+  labs(title = "Out-of-Pocket Expenditure by Insurance Status (capped at $5,000)",
+       x = "Insurance Status", y = "OOP Expenditure ($)") +
+  theme_minimal() + theme(legend.position = "none")
+```
+
+Out-of-pocket expenditure is strongly right-skewed, with a weighted population mean of approximately $`r round(as.numeric(wtd_oop), 0)` and a long upper tail driven by a minority of high-cost cases. The violin plots by insurance status reveal an important pattern: privately insured adults concentrate the highest OOP expenditure, which reflects both their higher utilization and cost-sharing obligations. A notable proportion of uninsured adults report zero OOP expenditure — not because they pay nothing, but because they have zero recorded healthcare utilization. This "zero utilization" among the uninsured is itself a manifestation of hidden exclusion: individuals who cannot afford care simply forgo it, leaving no trace in expenditure records.
+
+
+## Geographic Distribution of Access Barriers
+
+```{r eda_region_heatmap, fig.width=9, fig.height=5}
+region_barrier_pov <- svyby(~any_barrier, ~region + povcat,
+                              meps_svy, svymean, na.rm = TRUE) %>%
+  as.data.frame() %>%
+  mutate(pct_barrier = any_barrier * 100)
+
+ggplot(region_barrier_pov, aes(x = region, y = povcat, fill = pct_barrier)) +
+  geom_tile(color = "white", size = 0.5) +
+  geom_text(aes(label = round(pct_barrier, 1)), size = 3.5, color = "black") +
+  scale_fill_gradient(low = "#ffffcc", high = "#d73027", name = "% with Barrier") +
+  labs(title = "Access Barrier Rate by Census Region and Income Category — Weighted (%)",
+       subtitle = "Darker cells indicate higher proportions facing care barriers",
+       x = "Census Region", y = "Income Category") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 20, hjust = 1))
+```
+
+```{r eda_region_table}
+region_tbl <- svyby(
+  ~any_barrier + uninsured + poor_health + office_visits,
+  ~region, meps_svy, svymean, na.rm = TRUE
+) %>%
+  as.data.frame() %>%
+  mutate(
+    `% Any Barrier` = round(any_barrier   * 100, 1),
+    `% Uninsured`   = round(uninsured     * 100, 1),
+    `% Poor Health` = round(poor_health   * 100, 1),
+    `Avg Visits`    = round(office_visits, 1)
+  ) %>%
+  dplyr::select(region, `% Any Barrier`, `% Uninsured`, `% Poor Health`, `Avg Visits`)
+
+knitr::kable(region_tbl,
+             caption = "Key Access and Health Indicators by Census Region — Weighted (%)") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"))
+```
+
+The geographic distribution of access barriers shows moderate variation across the four Census regions. The South consistently shows higher barrier and uninsured rates compared to the Northeast, while the West displays a mixed profile with above-average barrier rates in lower-income categories. The heatmap reveals that the income gradient in barriers is present in all regions — poor and near-poor adults face substantially higher barriers regardless of geography — but its magnitude varies across regions.
+
+
+## Correlation Among Key Continuous Variables
+
+```{r eda_corr, fig.width=7, fig.height=6}
+num_df <- meps_adults %>%
+  dplyr::select(age, n_chronic, office_visits, er_visits, total_exp, oop_exp) %>%
+  na.omit()
+
+corrplot(cor(num_df),
+         method = "color", type = "upper",
+         addCoef.col = "black", number.cex = 0.75,
+         tl.col = "black", tl.srt = 40,
+         title = "Correlation Matrix — Key Continuous Variables",
+         mar = c(0, 0, 1.5, 0))
+```
+
+Office visits have a mean of ≈ 4 and a variance of ≈ 40–50: the variance far exceeds the mean, indicating overdispersion that rules out the Poisson model. Emergency room (ER) visits show an even more concentrated distribution around zero with a longer right tail.
+The correlation matrix between continuous variables confirms expected associations: age and n_chronic are positively correlated (~0.45); n_chronic and office_visits show moderate-to-high correlation (~0.35–0.40); total_exp and oop_exp are strongly correlated (~0.60–0.70).
+
+---
+
+# Logistic Regression 
+
+This part shifts the focus from descriptive analysis to causal inference. While the EDA demonstrated that access barriers exist and vary across demographic groups, the next step is a more precise investigation aimed at identifying the independent predictors of access barriers after controlling for age, sex, health status, education, and other potential confounders. The key objective is to determine whether insurance status persists as a significant driver of healthcare access disparities and which demographic groups face the highest barrier risk once cofactors are accounted for.
+
+The outcome variable is "any_barrier": a binary indicator equal to 1 if a respondent experienced either delayed care or unaffordable care in the past 12 months, and 0 otherwise. This outcome is well-suited to logistic regression, where the fitted model estimates the probability P(barrier = 1 | predictors) — the probability of facing at least one access barrier given observed characteristics.
+
+
+## Bivariate Analysis
+
+Before fitting the model, the relationship between the two main structural determinants of interest (insurance coverage and income level) and access barriers is examined. This preliminary analysis provides an initial assessment of the unadjusted association between socio-economic disadvantage and healthcare accessibility.
+
+**Insurance Status and Barriers:**
+
+```{r logit_bivariate}
+tb_ins <- prop.table(xtabs(~ ins_status + any_barrier, data = meps_adults), 1)
+print(round(tb_ins, 3))
+
+rr_unins <- tb_ins["Uninsured", "1"] / tb_ins["Any Private", "1"] 
+or_unins <- (tb_ins["Uninsured", "1"] / tb_ins["Uninsured", "0"]) /
+  (tb_ins["Any Private", "1"] / tb_ins["Any Private", "0"])
+```
+
+```{r logit_bivariate_output, echo=FALSE}
+cat("Crude Risk Ratio (Uninsured vs Private):", round(rr_unins, 2), "\n")
+cat("Crude Odds Ratio (Uninsured vs Private):", round(or_unins, 2), "\n")
+```
+
+Approximately 29.2% of uninsured adults report access barriers, compared to just 8.8% of those with private insurance and 10.0% of those with public coverage. This translates to a crude risk ratio (RR) of `r round(rr_unins, 2)`: the uninsured are more than three times as likely to face barriers.
+
+**Income and Barriers:**
+
+```{r}
+tb_pov <- prop.table(xtabs(~ povcat + any_barrier, data = meps_adults), 1)
+print(round(tb_pov, 3))
+```
+
+The income gradient reveals a coverage gap pattern: while high-income adults face the lowest barriers (6.5%), the poorest adults face barriers at 14.8%. In particular, near-poor individuals (17%) experience the highest barrier rate, a surprising finding consistent with the coverage gap hypothesis, where individuals just above the poverty threshold lose public insurance eligibility without gaining private coverage. This non-monotone gradient demonstrates that income matters substantially, but the discontinuity in insurance coverage at the poverty line creates the steepest disparities in barrier risk.
+
+**Chi-square Test:**
+
+```{r}
+test_ins <- chisq.test(table(meps_adults$ins_status, meps_adults$any_barrier))
+```
+
+```{r logit_chisq_output, echo=FALSE}
+cat("Chi-square test (insurance × barrier):\n")
+cat("χ² =", round(test_ins$statistic, 2), ", p-value =", test_ins$p.value, "\n\n")
+```
+
+```{r}
+test_pov <- chisq.test(table(meps_adults$povcat, meps_adults$any_barrier))
+```
+
+```{r logit_chisq_pov_output, echo=FALSE}
+cat("Chi-square test (income × barrier):\n")
+cat("χ² =", round(test_pov$statistic, 2), ", p-value =", test_pov$p.value, "\n")
+```
+
+Both associations are highly significant (p < 0.001), confirming that insurance and income are not independent of access barriers. However, insurance and income are themselves associated: lower-income individuals are more likely to be uninsured or publicly insured. When we fit the multivariable model below, we expect the crude OR to shrink after we control for income, but if the adjusted OR remains substantially high, this indicates that insurance effects are not merely a proxy for income.
+
+```{r logit_reference_levels}
+# Set reference levels for categorical variables
+meps_adults$ins_status <- relevel(meps_adults$ins_status, ref = "Any Private")
+meps_adults$povcat <- relevel(meps_adults$povcat, ref = "High Income (400%+)")
+meps_adults$race_eth <- relevel(meps_adults$race_eth, ref = "White Non-Hispanic")
+meps_adults$sex <- relevel(meps_adults$sex, ref = "Male")
+meps_adults$age_group <- relevel(meps_adults$age_group, ref = "18-34")
+```
+
+**Reference Categories Chosen:**
+
+- **Insurance**: "Any Private" 
+
+- **Income**: "High Income (400%+ FPL)" 
+
+- **Race/Ethnicity**: "White Non-Hispanic" 
+
+- **Sex**: "Male" 
+
+- **Age**: "18-34"
+
+
+## Test: Are Survey Weights Necessary?
+
+The MEPS survey design involves sampling weights (`perwt`), strata (`varstr`), and clusters (`varpsu`). Ideally, regression models would incorporate this design information to produce valid population-level inference. However, standard GLM functions in R do not support complex survey designs. To determine whether ignoring weights causes bias, we test whether normalized weights are significant predictors in an unweighted logistic model.
+
+```{r logit_weights_test}
+# Include normalized weights as a fixed effect to test their significance
+model_weights_test <- glm(any_barrier ~ ins_status + povcat + sex + age_group + race_eth +
+                          poor_health + any_chronic + educ_cat + region + perwt_norm, 
+                          family = binomial,
+                          data = meps_adults)
+
+weights_coef <- coef(model_weights_test)["perwt_norm"]
+weights_se <- summary(model_weights_test)$coefficients["perwt_norm", "Std. Error"]
+weights_z <- summary(model_weights_test)$coefficients["perwt_norm", "z value"]
+weights_p <- summary(model_weights_test)$coefficients["perwt_norm", "Pr(>|z|)"]
+```
+
+```{r logit_weights_output, echo=FALSE}
+cat("Coefficient:", round(weights_coef, 6), "\n")
+cat("Std. Error:", round(weights_se, 6), "\n")
+cat("z-statistic:", round(weights_z, 4), "\n")
+cat("p-value:", round(weights_p, 4), "\n")
+```
+
+The weights are not statistically significant (p > 0.05), indicating that the unweighted logistic model produces population-representative estimates.
+
+
+## Logistic Regression Model
+
+```{r logit_model}
+model_logit <- glm(any_barrier ~ ins_status + povcat + sex + age_group + race_eth + 
+                   poor_health + any_chronic + educ_cat + region, 
+                   family = binomial,
+                   data = meps_adults)
+
+summary(model_logit)
+```
+
+**Key findings from the summary output:**
+
+- **Uninsured**: Coefficient = `r round(coef(model_logit)["ins_statusUninsured"], 3)`, adjusted OR = `r round(exp(coef(model_logit)["ins_statusUninsured"]), 3)`. Despite controlling for income, health status, and education, the uninsured retain dramatically elevated odds of barriers. The adjusted OR is only slightly lower than the crude OR of 4.27, confirming that insurance effects are largely independent of income confounding. This suggests that the barrier faced by the uninsured is a direct consequence of lacking coverage, not merely a proxy for being poor.
+
+- **Public Only**: Coefficient = `r round(coef(model_logit)["ins_statusPublic Only"], 3)`, adjusted OR = `r round(exp(coef(model_logit)["ins_statusPublic Only"]), 3)`. This is a key finding: in the crude data, publicly insured individuals report more barriers than the privately insured (10.0% vs 8.8%), but after adjusting for income and other confounders, the relationship reverses. The adjusted OR indicates that public insurance reduces barrier odds. This pattern reflects the substantial income confounding: publicly insured individuals are disproportionately poor, and poverty drives barriers. Once poverty is held constant, public insurance appears protective, likely because program covers a broader segment of the low-income population who would otherwise be uninsured.
+
+- **Income Gradient**: All low-income categories show elevated barriers compared to the high-income reference. The risk of barriers decreases with increasing income, although not in a perfectly linear way: the "Near Poor" category frequently shows the highest risk, consistent with the coverage gap hypothesis.
+
+- **Age**: Older age groups show lower odds of barriers compared to the 18–34 reference. This likely reflects better insurance coverage and more consistent healthcare engagement in older populations.
+
+- **Sex**: Women have `r round(exp(coef(model_logit)["sexFemale"]), 3)` times higher adjusted odds of reporting barriers than men. This is a robust equity finding, because it shows that women face more barriers even after controlling for all structural and clinical variables.
+
+- **Race/Ethnicity**: Surprisingly, after adjusting for insurance, income, and other confounders, Black, Hispanic, and Asian adults show lower reported barriers than White adults. 
+
+- **Health Status**: Both `poor_health` and `any_chronic` show elevated odds of barriers, as expected: sicker individuals encounter more obstacles.
+
+- **Education**: Higher educational attainment is associated with more reported barriers, not fewer. One interpretation is that more educated individuals may more accurately recognize and report barriers they encounter, or have higher expectations for access and thus perceive obstacles more acutely.
+
+- **Region**: Non-Northeast regions show elevated barrier odds, but with varying strength. The Midwest and West show statistically significant increases in barriers relative to the Northeast. The South shows a trend that approaches significance but does not reach the conventional 0.05 threshold. This geographic variation suggests that rural healthcare infrastructure, insurance availability, and provider networks differ across regions, with the Northeast offering relatively better access.
+
+
+# Odds Ratios
+```{r logit_or}
+# Extract adjusted odds ratios with 95% CIs
+logit_tidy <- broom::tidy(model_logit, exponentiate = TRUE, conf.int = TRUE) %>%
+  filter(term != "(Intercept)") %>%
+  rename(OR = estimate, CI_low = conf.low, CI_high = conf.high) %>%
+  mutate(Significant = ifelse(p.value < 0.05, "Yes", "No"))
+
+knitr::kable(
+  logit_tidy %>% dplyr::select(term, OR, CI_low, CI_high, p.value, Significant),
+  digits = 3,
+  caption = "Logistic Regression: Adjusted Odds Ratios for Any Access Barrier"
+) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"))
+```
+
+
+## Model Fit and Predictive Accuracy
+
+```{r logit_fit}
+# Null model (intercept only) 
+null_logit <- glm(any_barrier ~ 1, family = binomial, data = meps_adults)
+```
+
+```{r logit_pseudo_r2}
+# McFadden's Pseudo-R²
+pseudo_r2 <- 1 - logLik(model_logit) / logLik(null_logit)
+```
+
+```{r logit_pseudo_r2_output, echo=FALSE}
+cat("McFadden's Pseudo-R²:", round(as.numeric(pseudo_r2), 4), "\n\n")
+```
+
+```{r logit_brier}
+# ROC curve and AUC
+predicted_probs <- predict(model_logit, type = "response")
+roc_obj <- roc(model_logit$y, predicted_probs)
+auc_value <- auc(roc_obj)
+```
+
+```{r logit_roc_plot, fig.width=7, fig.height=6}
+plot(roc_obj, col = "#2C7BB6", lwd = 2.5,
+     main = "ROC Curve — Logistic Regression for Access Barriers",
+     cex.main = 1.2, print.auc = TRUE,
+     print.auc.x = 0.5, print.auc.cex = 1.2)
+```
+
+The model achieves an AUC of `r round(as.numeric(auc_value), 3)`, indicating good discrimination: the model correctly ranks a random barrier case as higher risk than a random non-barrier case about 70% of the time. 
+
+
+## Predicted Probabilities
+
+To make the model results interpretable, we compute predicted barrier probabilities across insurance status and income levels, holding all other variables at their modal or mean values.
+
+```{r logit_margins}
+avg_values <- list(sex = names(sort(table(meps_adults$sex), decreasing = TRUE))[1],
+                   age_group = names(sort(table(meps_adults$age_group), decreasing = TRUE))[1],
+                   race_eth = names(sort(table(meps_adults$race_eth), decreasing = TRUE))[1],
+                   educ_cat = names(sort(table(meps_adults$educ_cat), decreasing = TRUE))[1],
+                   region = names(sort(table(meps_adults$region), decreasing = TRUE))[1],
+                   poor_health = mean(meps_adults$poor_health, na.rm = TRUE),
+                   any_chronic = mean(meps_adults$any_chronic, na.rm = TRUE))
+
+pred_grid <- expand.grid(ins_status = levels(meps_adults$ins_status),
+                         povcat = levels(meps_adults$povcat),
+                         sex = avg_values$sex,
+                         age_group = avg_values$age_group,
+                         race_eth = avg_values$race_eth,
+                         educ_cat = avg_values$educ_cat,
+                         region = avg_values$region,
+                         poor_health = avg_values$poor_health,
+                         any_chronic = avg_values$any_chronic)
+
+pred_grid$prob <- predict(model_logit, newdata = pred_grid, type = "response")
+
+subtitle_text <- sprintf("Reference profile: %s, %s, %s, %s region, avg n_chronic=%.1f",
+                         avg_values$sex, avg_values$age_group, avg_values$race_eth, 
+                         avg_values$region, avg_values$any_chronic)
+
+ggplot(pred_grid, aes(x = povcat, y = prob, color = ins_status, group = ins_status)) +
+       geom_line(size = 1.2) +
+       geom_point(size = 3) +
+       scale_color_brewer(palette = "Set1", name = "Insurance Status") +
+       scale_y_continuous(labels = percent_format()) +
+       labs(title = "Predicted Probability of Access Barriers",
+            subtitle = subtitle_text,
+            x = "Income Category (% Federal Poverty Level)",
+            y = "P(barrier)") +
+       theme_minimal() +
+       theme(axis.text.x = element_text(angle = 30, hjust = 1, size = 9))
+```
+
+The graph illustrates how insurance status and income jointly shape predicted access barriers:
+
+- **Insurance effect**: Across all income categories, uninsured individuals exhibit substantially higher predicted barrier probabilities than both privately and publicly insured individuals, highlighting the central role of insurance coverage in healthcare access.
+
+- **Income gradient**: Within each insurance group, barrier probabilities generally increase as income decreases, indicating that economic disadvantage amplifies difficulties in accessing care.
+
+- **Concentrated vulnerability**: The highest predicted barrier probabilities are observed among uninsured near-poor individuals, whose risk exceeds 50%, while high-income insured individuals experience the lowest probabilities of barriers.
+
+- **Public coverage as partial protection**: After adjustment, publicly insured individuals display barrier probabilities that are very similar to (and in some cases slightly lower than) privately insured individuals, suggesting that public insurance may partially offset the disadvantages associated with low income.
+
+The model supports the hypothesis that healthcare access in the United States is jointly shaped by insurance coverage and socioeconomic status, producing substantial disparities in the ability to obtain healthcare.
+
+---
+
+# Negative Binomial Regression 
+
+This part answers the central research question of the MEPS analysis: who uses more healthcare services, and what drives those differences? The two outcomes studied are office-based visits (office_visits) and emergency room visits (er_visits), both count variables that measure how many times each patient accessed a specific type of care in USA during 2019.
+
+So, which statistical model is appropriate for count data like these? The natural candidate is the Poisson model, which is designed for count data However, Poisson carries a strict assumption, i.e the variance must equal the mean. But in this scenario we'll see how a small fraction of patients accumulate a disproportionately large share of visits, creating a heavily right-skewed distribution where variance far exceeds the mean. This condition is called overdispersion, and fitting a Poisson model to overdispersed data produces incorrect inference.
+The Negative Binomial (NB) model solves this problem, by adding a dispersion parameter θ (theta) that allows variance to grow beyond the mean. So, in the first part we'll see whether overdispersion is present, then estimates the NB models, interprets the results, and finally reveals the hidden exclusion mechanism through a descriptive analysis.
+
+**Test for Overdispersion**
+
+The purpose of the first chunk nb_overdispersion if test whether Poisson is adequate.
+The first block estimates a baseline Poisson model and then performs the test for overdispersion using AER::dispersiontest(). This test formally verifies whether the variance of the data significantly exceeds the mean, a fundamental requirement of the Poisson distribution. The Poisson distribution assumes that the mean and variance are equal (E[Y] = Var[Y]). The parameter α (alpha) measured by the test represents the coefficient of additional dispersion. If α = 0, we are in the Poisson case; if α > 0 (and statistically significant), the Negative Binomial model is preferable. 
+
+Why it matters? 
+
+•    A Poisson model with overdispersion produces underestimated standard errors
+
+•    This inflates z-scores and lowers p-values
+
+•    There is a risk of declaring predictors significant that are not
+
+•    The NB model corrects this problem by adding a dispersion parameter θ (theta)
+
+```{r nb_overdispersion}
+pois_model_office  <- glm(
+  office_visits ~ ins_status + age_group + sex + race_eth + povcat + n_chronic + poor_health + educ_cat + region + any_barrier,
+  family = poisson,
+  data   = meps_adults
+)
+
+pois_model_er <- glm(
+  er_visits ~ ins_status + age_group + sex + race_eth + povcat + 
+    n_chronic + poor_health + educ_cat + any_barrier + region,
+  family = poisson,
+  data = meps_adults
+)
+
+disp_test1 <- AER::dispersiontest(pois_model_office, trafo = 1)
+disp_test2 <- AER::dispersiontest(pois_model_er, trafo = 1)
+print(disp_test1)
+print(disp_test2)
+cat("α (dispersion):", round(disp_test1$estimate, 3), "\n")
+cat("α (dispersion):", round(disp_test2$estimate, 3), "\n")
+cat("AIC:", round(AIC(pois_model_office), 1), "\n")
+cat("AIC:", round(AIC(pois_model_er), 1), "\n")
+
+```
+
+POISSON MODEL OFFICE VISITS:
+Values like α = 25.88, z = 7.2042, p-value = 2.919e-13 indicate massive overdispersion. This means that the variance of the medical visits is much greater than their mean.  
+Also, since p-value is extremely small (much less than 0.05), we reject the null hypothesis that the data follow a Poisson distribution.
+
+POISSON MODEL ER VISITS:
+α = 0.639, z = 9.73, p-value < 2.2e-16
+There is also significant overdispersion for the PS, although to a lesser extent (the distribution is more concentrated around zero with a long right tail).
+
+A small fraction of patients accounts for a disproportionately high number of visits, resulting in a distribution that is heavily skewed to the right, where the variance far exceeds the mean.
+
+The code also prints AIC for both Poisson models. These values serve as the baseline for comparison in the fit summary table. The expected values are approximately 298,200 for office visits and 25.500 for ER visits — both will be dramatically higher than the corresponding NB models, confirming the inadequacy of Poisson.
+
+So, A Poisson model applied to these data would have underestimated the standard errors, inflated the z-scores, and produced systematic false positives. 
+
+
+## Negative Binomial Models
+To correct for this, we implemented Negative Binomial (NB) models via maximum likelihood (MASS::glm.nb) 
+Both models are based on the same 10 predictors, covering  all major dimensions of healthcare.
+Theta θ is the dispersion parameter that describes data distribution and controls the dispersion. Since θ appears in the denominator of the variance, a small θ indicates high overdispersion; when θ → ∞, the variance converges to μ and the model converges to the Poisson distribution. In our case, θ = 0.613 (outpatient visits) and θ = 0.502 (ER), values far from ∞, which confirm the need for the Negative Binomial model.
+
+
+## Model Structure of NB Office Visits and ER visists 
+The model estimates the expected number of patient office visits and emergency ones, in USA healthcare system. As we understand, we the Negative Binomial family because the healthcare count data is overdispersed—the variance is much greater than the mean. The model accounts for overdispersion. The difference is that the model now has the tools to describe data accurately.
+
+The link function is logarithmic, so the coefficients are interpreted as logarithms of Incidence Rate Ratios (IRR = exp(coefficient)).
+The logarithmic link function means coefficients are on the log-count scale: exp(coefficient) gives the Incidence Rate Ratio (IRR), the multiplicative change in expected visits for a unit change in the predictor.
+
+## Interpretation  
+For Office visits NB: SE = 0.00693, θ = 0.613 is very low. This indicates very high over-dispersion: visits are highly concentrated on few patients —the variance of the visits is approximately Var[Y] = μ + μ²/0.613,it grows quadratically with the mean, driven by a small group of very high utilization patients. The distribution of visits is highly skewed, with a small number of patients accounting for a very high/large number of visits. 
+
+For ER visits NB: SE = 0.0221, θ = 0.502 (even lower than the previous one), higher over-dispersion, the distribution has more zeros and longer tail. 
+
+This makes clinical sense: most people have zero ER visits in a year, while a small subset of very ill patients have many. The distribution is more concentrated at zero and has a longer right tail than office visits, producing greater overdispersion. Both θ values are far below the threshold where NB converges to Poisson (θ > 10), confirming the necessity of the NB family for both models, the Poisson model would have massively underestimated the standard errors and produced false positives. 
+
+```{r nb_office_visits, nb_er_visits}
+model_nb_office <- MASS::glm.nb(
+  office_visits ~ ins_status + age_group + sex + race_eth + povcat + 
+    n_chronic + poor_health + educ_cat + any_barrier + region,
+  data = meps_adults
+)
+
+summary(model_nb_office)
+cat("\nNB Theta:", round(model_nb_office$theta, 3), "\n")
+cat("AIC:", round(AIC(model_nb_office), 1), "\n")
+
+model_nb_er <- MASS::glm.nb(
+  er_visits ~ ins_status + age_group + sex + race_eth + povcat + 
+    n_chronic + poor_health + educ_cat + any_barrier + region,
+  data = meps_adults
+)
+
+summary(model_nb_er)
+cat("\nNB Theta:", round(model_nb_er$theta, 3), "\n")
+cat("AIC:", round(AIC(model_nb_er), 1), "\n")
+
+```
+
+Office visits:
+•	n_chronic (z ≈ 28.8): highest z in the entire model. The strongest and most precisely estimated predictor. Each chronic condition increases visits by ~31%.
+
+•	ins_statusUninsured (z ≈ −27.6): second highest z in absolute value. The strongest structural barrier. The uninsured make 69% fewer visits than the privately insured.
+
+•	sexFemale (z ≈ 20.3): women make 47% more visits than men — large, robust, stable effect.
+
+•	All regional coefficients significant: geography matters for ambulatory care.
+
+ER visits:
+•	poor_health (z ≈ 19.6): by far the strongest predictor in the ER model. IRR ≈ 2.4 — those in poor health go to the ER 2.4 times more often.
+
+•	All povcat coefficients reverse sign: poverty groups that had fewer office visits now have MORE ER visits.
+
+•	All regional coefficients non-significant: geography disappears completely in the ER model.
+
+•	age_group65+ non-significant (p = 0.989): Medicare protects the elderly from ER dependence.
+
+
+## Model Comparison and IRR
+Likelihood Ratio Test — Poisson vs. NB
+The LRT formally tests whether adding θ improves the model significantly.
+
+```{r nb_comparison}
+cat("Poisson vs Negative Binomial (Office Visits and ER visits)")
+
+
+lmtest::lrtest(pois_model_office, model_nb_office)
+lmtest::lrtest(pois_model_er, model_nb_er)
+```
+
+The tests show that for both outcomes (office_visits and er_visits), the Poisson model is unsuitable due to the high overdispersion in the data. The negative binomial model provides a statistically superior fit and is the appropriate choice for proceeding with inference and the interpretation of the coefficients. 
+
+```{r IRR results }
+# Office visits
+office_tidy <- broom::tidy(model_nb_office, exponentiate = TRUE, conf.int = TRUE) %>%
+  filter(term != "(Intercept)") %>%
+  rename(IRR = estimate, CI_low = conf.low, CI_high = conf.high)
+
+knitr::kable(office_tidy %>% dplyr::select(term, IRR, CI_low, CI_high, p.value),
+             digits = 3,
+             caption = "NB Regression: Incidence Rate Ratios — Office Visits") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"))
+
+# ER visits - emergency room visits
+er_tidy <- broom::tidy(model_nb_er, exponentiate = TRUE, conf.int = TRUE) %>%
+  filter(term != "(Intercept)") %>%
+  rename(IRR = estimate, CI_low = conf.low, CI_high = conf.high)
+
+knitr::kable(
+  er_tidy %>% dplyr::select(term, IRR, CI_low, CI_high, p.value),
+  digits  = 3,
+  caption = "NB Regression: Incidence Rate Ratios — ER Visits"
+) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"))
+```
+
+The IRR (Incidence Rate Ratio) is obtained by exponentiating each regression coefficient. It expresses the multiplicative change in expected visits associated with belonging to a category, relative to the reference group, holding all other variables constant.
+
+OFFICE VISITS IRR
+Insurance is the single most powerful structural determinant of ambulatory care utilization in the model.
+
+Uninsured vs Private	coeff: −1.164, IRR: 0.312,	CI:[0.288 – 0.339], z-value:−27.6	
+interpretation: 69% fewer visits — structural exclusion
+
+Public Only vs Private	coeff:+0.109, IRR: 1.115,	CI:[1.063 – 1.171], z-value:+4.4	
+Interpretation: 11.5% more visits — Medicaid nearly closes the gap. 
+
+The uninsured IRR of 0.312 is the most important number in the entire office visit model. After controlling for age, sex, ethnicity, income, health status, education, and region — all factors that might independently explain lower utilization — the uninsured still make only 31% as many visits as the privately insured. This is not explained by better health. It reflects pure structural exclusion from the ambulatory care system: without insurance, the direct cost of a scheduled visit is prohibitive. 
+
+Chronic Conditions: The Dominant Clinical Predictor
+n_chronic: IRR = 1.311 per additional condition, z = 28.8 (highest z in the model)
+A patient with 5 chronic conditions is expected to make nearly 4 times as many office visits as a patient with none, all else equal. This reflects the appropriate use of ambulatory care for chronic disease management — when access is available.
+
+
+Self-Rated Health
+poor_health: IRR = 1.687, z = 18.4 — those who rate their health as fair or poor make 69% more office visits. This captures both real clinical burden and health-seeking behavior. Importantly, this effect amplifies dramatically in the ER model (IRR = 2.416), where poor health becomes the single strongest predictor.
+
+Sex
+Female: IRR = 1.469, z = 20.3 — women make 47% more office visits than men. This reflects higher use of preventive and reproductive health services, and a well-documented greater propensity to seek care for symptoms. The effect is large, precise, and consistent across all subgroups.
+
+
+Education — The System Navigation Effect
+
+Level (vs. No HS)	IRR Office	Significant?	IRR ER	Significant?	Pattern
+Some HS	             1.021	  No (p=0.690)	1.469	   Yes 	        Reversal
+HS Grad	             1.037	  No (p=0.433)	1.235	   Yes  	      Reversal
+Some College	       1.285	    Yes         1.217	   Yes  	    Positive both
+College+	1.477	                Yes    	    0.946	 No (p=0.541)     Reversal
+
+The education pattern tells that higher education increases planned ambulatory visits (College+ = +48%) but does not increase ER use (non-significant). Lower education produces the opposite: no effect on office visits, but strongly predicts ER use (Some HS = +47% more ER visits). What we can assume is that education is not a proxy for health status,it is a proxy for the capacity to navigate the healthcare system proactively and prevent conditions from becoming emergencies.
+
+Race and Ethnicity 
+
+Black Non-Hispanic patients make 35% fewer office visits than White Non-Hispanic patients, even after controlling for income, insurance, age, sex, health, and education. Yet in the ER model, their IRR is 1.072 — not significantly different from White patients (p = 0.191). This pattern reveals hidden exclusion at the racial level: the ambulatory care gap does not reflect lower need — it reflects structural exclusion from primary care. The unmet need is then expressed in the emergency room, where legal access is guaranteed. Patients are not receiving less healthcare in absolute terms; they are receiving it in the wrong place.
+
+
+Income
+Every low-income group reverses sign between the two models. This is the statistical proof of the substitution mechanism: poverty blocks access to planned ambulatory care and pushes toward emergency care as the only available channel. The Near Poor group (100–124% FPL) shows the strongest reversal. So, this is the coverage gap: too rich for Medicaid in many states, too poor for private insurance.
+
+
+Region — Disappears in the ER Model
+
+Region (vs. Northeast)	IRR Office	Sign.?	IRR ER	  Sign.?
+Midwest	                  0.881	*** (−12%)	 1.110  No(p=0.077)
+South	                    0.754	*** (−25%)	0.987	No (p=0.806)
+West	                   0.900	*** (−10%)	0.938	No (p=0.286)
+
+The South shows the largest geographic penalty for office visits (−25%), yet is completely indistinguishable from the Northeast for ER visits (p = 0.806). Emergency departments are distributed more uniformly across the territory than primary care providers. Healthcare desertification — concentrated in rural South and Midwest — affects planned care, not emergency access. This distinction matters for policy: expanding ER capacity in the South would not address the geographic disparity in primary care access.
+
+When structural barriers (lack of insurance, low educational attainment, poverty, membership in ethnic minorities, or living in the South) prevent access to scheduled primary care (office visits), the clinical need does not disappear; rather, it spills over into the only channel available to everyone: the emergency room (ER visits).
+
+```{r Forest plots}
+# Forest plot for office visits
+office_tidy %>%
+  filter(str_detect(term, "ins_status|povcat|race_eth|any_barrier|n_chronic")) %>%
+  ggplot(aes(x = IRR, y = reorder(term, IRR))) +
+  geom_point(size = 3, color = "#4575B4") +
+  geom_errorbarh(aes(xmin = CI_low, xmax = CI_high), height = 0.2) +
+  geom_vline(xintercept = 1, linetype = "dashed", color = "grey40") +
+  labs(title = "Incidence Rate Ratios: Office Utilization",
+       x = "IRR (95% CI)", y = "") +
+  theme_minimal()
+
+# Forest plot for er visits 
+er_tidy %>%
+  filter(str_detect(term, "ins_status|povcat|race_eth|any_barrier|n_chronic")) %>%
+  ggplot(aes(x = IRR, y = reorder(term, IRR))) +
+  geom_point(size = 3, color = "#4575B4") +
+  geom_errorbarh(aes(xmin = CI_low, xmax = CI_high), height = 0.2) +
+  geom_vline(xintercept = 1, linetype = "dashed", color = "grey40") +
+  labs(title = "Incidence Rate Ratios: Emergency room Utilization",
+       x = "IRR (95% CI)", y = "") +
+  theme_minimal()
+
+```
+
+Both forest plots filter to the same set of predictors: ins_status, povcat, race_eth, any_barrier, n_chronic. This selection deliberately combines structural barriers (insurance, income, ethnicity, access barriers) with clinical need variables (n_chronic), answering the question: does insurance status matter more or less than chronic disease burden in determining utilization?
+•	Points left of the dashed line (IRR < 1): the variable is associated with fewer visits than the reference group
+•	Points right of the dashed line (IRR > 1): the variable is associated with more visits
+•	Error bars not crossing the dashed line: the effect is statistically significant at α = 0.05
+•	reorder(term, IRR): sorts predictors from lowest to highest IRR — negative effects anchor the bottom of the plot, positive effects the top
+
+The key visual message of the office visits plot: ins_statusUninsured anchors the far left (IRR ≈ 0.31) while n_chronic and poor_health anchor the far right (IRR ≈ 1.31 and 1.69). The plot answers its central question visually: clinical need and structural access are approximately equal in magnitude, but pull in opposite directions. A patient who needs care (n_chronic) AND lacks access (Uninsured) faces effects that partially cancel — but the structural exclusion wins, as the 2×2 hidden exclusion analysis confirms.
+The key visual difference in the ER plot: the income variables (povcat) all shift to the right — the reversal that was in the IRR table is now immediately visible. The uninsured point moves closer to 1 (from 0.31 to 0.68). The Black Non-Hispanic point moves to essentially 1. This visual shift across the two plots is the most direct illustration of the two-circuit mechanism.
+
+```{r table}
+# Model fit summary table
+fit_table <- tibble(
+  Model     = c("Poisson (Office)", "NB (Office)",
+                "Poisson (ER)",    "NB (ER)"),
+  AIC       = c(round(AIC(pois_model_office),        1),
+                round(AIC(model_nb_office),   1),
+                round(AIC(pois_model_er),     1),
+                round(AIC(model_nb_er),       1)),
+  Deviance  = c(round(deviance(pois_model_office),       1),
+                round(deviance(model_nb_office),  1),
+                round(deviance(pois_model_er),    1),
+                round(deviance(model_nb_er),      1)),
+  Theta     = c("—",
+                round(model_nb_office$theta, 3),
+                "—",
+                round(model_nb_er$theta,     3)),
+  Preferred = c("", "✓", "", "✓")
+)
+
+knitr::kable(fit_table,
+             caption = "Model Fit Summary: Poisson vs. Negative Binomial") %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  row_spec(c(2, 4), bold = TRUE, background = "#E2EFDA")
+```
+
+The fit summary table consolidates all model comparison evidence in one place. Each row represents a model; green-highlighted rows are the preferred NB models.
+R² for NB Office ≈ 1 − (23,430 / 29,459) ≈ 0.205: this is considered excellent for individual-level health survey data. The threshold of 0.20 is the conventional benchmark for a 'good model' in social and health sciences. The ER model (R² ≈ 0.156) is good — ER visits are harder to predict because they include both necessary emergencies and avoidable ones driven by lack of primary care access.
+
+
+## Hidden Exclusion Analysis
+
+```{r nb_hidden_exclusion}
+hidden_df <- meps_adults %>%
+  group_by(any_barrier, any_chronic) %>%
+  summarise(
+    avg_office = round(mean(office_visits, na.rm = TRUE), 1),
+    avg_er     = round(mean(er_visits, na.rm = TRUE), 2),
+    n          = n(),
+    .groups    = "drop"
+  ) %>%
+  mutate(
+    Group = case_when(
+      any_barrier == 0 & any_chronic == 0 ~ "No Barrier / No Chronic",
+      any_barrier == 0 & any_chronic == 1 ~ "No Barrier / Chronic",
+      any_barrier == 1 & any_chronic == 0 ~ "Barrier / No Chronic",
+      any_barrier == 1 & any_chronic == 1 ~ "Barrier + Chronic"
+    )
+  )
+
+knitr::kable(hidden_df,
+             caption = "Average Utilization: Barriers × Chronic Status",
+             col.names = c("Barrier", "Chronic", "Avg Office Visits", "Avg ER Visits", "N", "Group")) %>%
+  kable_styling()
+
+hidden_df %>%
+  pivot_longer(cols = c(avg_office, avg_er),
+               names_to = "type", values_to = "average") %>%
+  mutate(type = ifelse(type == "avg_office", "Office Visits", "ER Visits")) %>%
+  ggplot(aes(x = Group, y = average, fill = type)) +
+  geom_col(position = "dodge") +
+  facet_wrap(~type, scales = "free_y")+
+  scale_fill_brewer(palette = "Set1", name = "") +
+  labs(title = "Average Utilization by Barrier and Chronic Status",
+       x = "", y = "Average Visits") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+
+
+```
+
+## The Hidden Exclusion Analysis 
+
+The code groups all patients into four cells defined by two binary variables — any_barrier (has at least one access barrier) and any_chronic (has at least one chronic condition). For each cell, it computes the mean office visits and mean ER visits.
+
+The Four Groups
+ 
+Group	                     Barriers	       Chronic     	Avg Office (Expected)	      Avg ER (Expected)	              Role in Analysis
+No Barrier / No Chronic	     No	              No	        3 – 5	                        0.10 – 0.20	        Healthy baseline — reference
+No Barrier / Chronic	       No	              Yes	        7 – 12	                      0.30 – 0.50	        Need met — benchmark for chronic patients
+Barrier / No Chronic	      Yes	              No	        2 – 4	                        0.20 – 0.30	        Barriers without clinical need
+Barrier + Chronic	          Yes	             Yes	         5 – 9	                      0.50 – 0.90	        HIDDEN EXCLUSION: need suppressed, ER elevated
+
+
+The critical contrast is between the two chronic condition groups:
+•	No Barrier / Chronic: patients with chronic conditions who have access to care use it appropriately. Office visits are high; ER visits are moderate and likely reflect acute episodes within a managed care context.
+•	Barrier + Chronic: patients with the same clinical profile but structural barriers. Office visits are substantially lower — not because they are healthier, but because they cannot access care. ER visits are higher — the emergency department becomes the residual access point for unmet primary care need.
+
+The Two Circuits of American Healthcare
+What we can conclude is there's an existence of two parallel care circuits in the American healthcare system:
+
+*Circuit*	                       
+Ambulatory care circuit	Insured, 
+*Who Uses It*
+high-income, educated
+ *Driven By*
+elderly	Insurance + resources to navigate system
+*Outcome*
+Appropriate preventive and chronic care management
+
+*Circuit*	
+Emergency care circuit	
+*Who Uses It*
+Uninsured, poor, Medicaid, 
+*Driven By*
+low education,Lack of alternatives — ER as default	
+*Outcome*
+Crisis-driven care, avoidable hospitalizations
+
+
+These two circuits are not independent choices. The patients in the emergency care circuit are not there because they prefer it — they are there because structural barriers have closed the ambulatory care circuit to them. The regression models quantify this: the same clinical need (same n_chronic, same poor_health) leads to 4× more office visits for an insured high-income patient than for an uninsured poor one.
+
+The American healthcare system does not distribute care according to need , it distributes care according to the structural capacity to access it. 
+The uninsured are not healthier than the insured; they simply cannot afford scheduled visits. 
+The poor are not receiving less total healthcare; they are receiving it in the emergency room instead of the doctor's office. 
+Racial minorities face barriers that persist even after controlling for income and insurance. 
+The sickest patients with access barriers do not receive less care because they need less, they receive it at the wrong time, in the wrong place, at greater cost and with worse clinical outcomes.
+
+---
+
+# Generalized Linear Mixed Models
+
+Parts 2 and 3 treated both `region` and `ins_status` as fixed-effect covariates — categorical predictors with specific, estimable coefficients relative to a reference category. This is the appropriate choice when the goal is to quantify the directional effect of each level: how much does the South differ from the Northeast, or how much do the uninsured differ from the privately insured?
+
+A Generalized Linear Mixed Model (GLMM) with either variable as a random effect asks a fundamentally different question: not how a specific group differs from the reference, but how much unexplained variability in healthcare utilization exists at the group level, beyond what individual-level predictors already capture.
+
+## GLMM: Region as Random Effect  (Office Visits)
+```{r glmm_office, message=FALSE, warning=FALSE}
+theta_office <- model_nb_office$theta
+
+glmm_office <- glmer(
+  office_visits ~ ins_status + age_group + sex + race_eth + povcat +
+    n_chronic + poor_health + educ_cat + any_barrier + (1 | region),
+  family  = negative.binomial(theta = theta_office),
+  data    = meps_adults,
+  control = glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 1e5))
+)
+
+summary(glmm_office)
+```
+
+```{r glmm_office_results}
+vc_office <- as.data.frame(lme4::VarCorr(glmm_office))
+icc_office <- vc_office$vcov[1] / (vc_office$vcov[1] + (pi^2 / 3))
+
+cat("Random-effect variance (region):", round(vc_office$vcov[1], 4), "\n")
+cat("Intraclass Correlation (ICC):", round(icc_office, 4), "\n\n")
+
+
+glmm_office_tidy <- broom.mixed::tidy(glmm_office, effects = "fixed",
+                                       exponentiate = TRUE, conf.int = TRUE) %>%
+                                       filter(term != "(Intercept)") %>%
+                                      rename(IRR = estimate, CI_low = conf.low, CI_high = conf.high)
+
+knitr::kable(
+  glmm_office_tidy %>% dplyr::select(term, IRR, CI_low, CI_high, p.value),
+  digits  = 3,
+  caption = "Fixed-Effect IRRs — Office Visits"
+) %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  row_spec(which(glmm_office_tidy$p.value < 0.05), bold = TRUE)
+```
+
+```{r glmm_office_ranef, fig.width=7, fig.height=3.5, echo=FALSE}
+
+# Caterpillar plot of region random effects
+ranef_df <- as.data.frame(lme4::ranef(glmm_office, condVar = TRUE)$region) %>%
+  tibble::rownames_to_column("region") %>%
+  rename(intercept = `(Intercept)`)
+
+condvar <- attr(lme4::ranef(glmm_office, condVar = TRUE)$region, "postVar")
+ranef_df$se <- sqrt(condvar[1, 1, ])
+
+ggplot(ranef_df, aes(x = reorder(region, intercept), y = intercept)) +
+  geom_point(size = 3, color = "#2C7BB6") +
+  geom_errorbar(aes(ymin = intercept - 1.96 * se,
+                    ymax = intercept + 1.96 * se), width = 0.2) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey40") +
+  coord_flip() +
+  labs(title = "Region Random Effects — Office Visits", subtitle = "Conditional modes ± 1.96 SE",
+       x = "", y = "Random Intercept (log scale)") +
+  theme_minimal()
+```
+
+```{r glmm_office_fit, echo=FALSE}
+r2_glmm <- MuMIn::r.squaredGLMM(glmm_office)
+cat("Marginal R² (fixed effects only):  ", round(r2_glmm[1, "R2m"], 4), "\n")
+cat("Conditional R² (fixed + random):   ", round(r2_glmm[1, "R2c"], 4), "\n")
+cat("AIC NB fixed-effect model:       ", round(AIC(model_nb_office), 1), "\n")
+cat("AIC GLMM (region random):        ", round(AIC(glmm_office), 1), "\n")
+```
+
+The random-effect variance for region is 0.0098, yielding an ICC of 0.003. This means that only 0.3% of the residual variability in office visit counts is attributable to between-region differences — the remaining 99.7% reflects heterogeneity among individuals within the same region. The caterpillar plot confirms this: all four regional random intercepts are close to zero, indicating that no region deviates meaningfully from the population average once individual characteristics are held constant.
+
+The marginal R² of 0.265 rises to just 0.269 when the regional random effect is added — an increment of 0.004 that confirms geography contributes almost nothing beyond what insurance status, income, age, health status, and education already capture.
+
+The AIC comparison reinforces this conclusion: the fixed-effect Negative Binomial model from Part 3 (AIC = 119,822) outperforms the GLMM (AIC = 119,835). The fixed-effect specification remains the preferred model for office visit counts.
+
+The fixed-effect IRRs are virtually identical to those from Part 3, which is itself a robustness result: insurance status remains the dominant structural predictor, the income gradient is monotone and dose-responsive, and clinical need predictors retain their magnitudes. The individual-level estimates are not confounded by any unobserved regional clustering.
+
+
+## GLMM: Region as Random Effect (ER Visits)
+```{r glmm_er, message=FALSE, warning=FALSE}
+
+theta_er <- model_nb_er$theta
+
+glmm_er <- glmer(
+  er_visits ~ ins_status + age_group + sex + race_eth + povcat +
+    n_chronic + poor_health + educ_cat + any_barrier +
+    (1 | region),
+  family = MASS::negative.binomial(theta = theta_er),
+  data = meps_adults,
+  control = glmerControl(
+    optimizer = "bobyqa",
+    optCtrl = list(maxfun = 1e5)
+  )
+)
+
+summary(glmm_er)
+```
+
+```{r glmm_er_results, echo=FALSE}
+vc_er   <- as.data.frame(lme4::VarCorr(glmm_er))
+icc_er  <- vc_er$vcov[1] / (vc_er$vcov[1] + (pi^2 / 3))
+
+cat("Random-effect variance (region):", round(vc_er$vcov[1], 4), "\n")
+cat("Intraclass Correlation (ICC):", round(icc_er, 4), "\n\n")
+
+glmm_er_tidy <- broom.mixed::tidy(glmm_er, effects = "fixed",
+                                   exponentiate = TRUE, conf.int = TRUE) %>%
+                                   filter(term != "(Intercept)") %>%
+                                  rename(IRR = estimate, CI_low = conf.low, CI_high = conf.high)
+
+knitr::kable(
+  glmm_er_tidy %>% dplyr::select(term, IRR, CI_low, CI_high, p.value),
+  digits  = 3,
+  caption = "Fixed-Effect IRRs — ER Visits"
+) %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  row_spec(which(glmm_er_tidy$p.value < 0.05), bold = TRUE)
+
+r2_glmm_er <- MuMIn::r.squaredGLMM(glmm_er)
+cat("Marginal R²:   ", round(r2_glmm_er[1, "R2m"], 4), "\n")
+cat("Conditional R²:", round(r2_glmm_er[1, "R2c"], 4), "\n")
+cat("AIC NB fixed-effect model:", round(AIC(model_nb_er), 1), "\n")
+cat("AIC GLMM (region random): ", round(AIC(glmm_er), 1), "\n")
+```
+
+The pattern for emergency department visits is even more conclusive. The random-effect variance for region is 0.0022, yielding an ICC of 0.0007 — effectively zero. The marginal and conditional R² are identical to three decimal places (0.074 and 0.075 respectively), and the AIC of the GLMM (23,741) is marginally worse than the fixed-effect NB model (23,739), confirming that the regional random effect adds no information for emergency utilization either.
+
+Taken together, the two GLMM models for region deliver a consistent and substantively important message: the structural disparities in healthcare utilization documented in Parts 2 and 3 are a national phenomenon, not a regional one. The South does not produce more hidden exclusion than the Northeast because it is in the South; it does so because it concentrates more uninsured, lower-income, and higher-barrier individuals. 
+
+
+## GLMM: Insurance Status as Random Effect (Office Visits)
+```{r glmm_ins_office, message=FALSE, warning=FALSE}
+
+theta_office <- model_nb_office$theta
+
+glmm_ins_office <- glmer(
+  office_visits ~ region + age_group + sex + race_eth + povcat +
+    n_chronic + poor_health + educ_cat + any_barrier + (1 | ins_status),
+  family  = negative.binomial(theta = theta_office),
+  data    = meps_adults,
+  control = glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 1e5))
+)
+
+summary(glmm_ins_office)
+```
+
+```{r glmm_ins_office_results, echo=FALSE}
+vc_ins_office <- as.data.frame(lme4::VarCorr(glmm_ins_office))
+icc_ins_office <- vc_ins_office$vcov[1] / (vc_ins_office$vcov[1] + (pi^2 / 3))
+
+cat("Random-effect variance (insurance status):", round(vc_ins_office$vcov[1], 4), "\n")
+cat("Intraclass Correlation (ICC):", round(icc_ins_office, 4), "\n\n")
+
+glmm_ins_office_tidy <- broom.mixed::tidy(glmm_ins_office, effects = "fixed",
+                                           exponentiate = TRUE, conf.int = TRUE) %>%
+                                           filter(term != "(Intercept)") %>%
+                                           rename(IRR = estimate, CI_low = conf.low, CI_high = conf.high)
+
+knitr::kable(
+  glmm_ins_office_tidy %>% dplyr::select(term, IRR, CI_low, CI_high, p.value),
+  digits  = 3,
+  caption = "GLMM: Fixed-Effect IRRs — Office Visits"
+) %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  row_spec(which(glmm_ins_office_tidy$p.value < 0.05), bold = TRUE)
+```
+
+```{r glmm_ins_office_ranef, fig.width=7, fig.height=3.5, echo=FALSE}
+# Caterpillar plot of insurance status random effects
+ranef_ins_df <- as.data.frame(lme4::ranef(glmm_ins_office, condVar = TRUE)$ins_status) %>%
+  tibble::rownames_to_column("ins_status") %>%
+  rename(intercept = `(Intercept)`)
+
+condvar_ins <- attr(lme4::ranef(glmm_ins_office, condVar = TRUE)$ins_status, "postVar")
+ranef_ins_df$se <- sqrt(condvar_ins[1, 1, ])
+
+ggplot(ranef_ins_df, aes(x = reorder(ins_status, intercept), y = intercept)) +
+  geom_point(size = 3, color = "#2C7BB6") +
+  geom_errorbar(aes(ymin = intercept - 1.96 * se,
+                    ymax = intercept + 1.96 * se), width = 0.2) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey40") +
+  coord_flip() +
+  labs(title = "Insurance Status Random Effects — Office Visits ",
+       subtitle = "Conditional modes ± 1.96 SE",
+       x = "", y = "Random Intercept (log scale)") +
+  theme_minimal()
+```
+
+```{r glmm_ins_office_fit, echo=FALSE}
+# Compare GLMM vs fixed-effect NB from Part 3
+r2_glmm_ins <- MuMIn::r.squaredGLMM(glmm_ins_office)
+cat("Marginal R² (fixed effects only):  ", round(r2_glmm_ins[1, "R2m"], 4), "\n")
+cat("Conditional R² (fixed + random):   ", round(r2_glmm_ins[1, "R2c"], 4), "\n")
+cat("AIC NB fixed-effect model:       ", round(AIC(model_nb_office), 1), "\n")
+cat("AIC GLMM (insurance random):     ", round(AIC(glmm_ins_office), 1), "\n")
+```
+
+The random-effect variance for insurance status is 0.3306, approximately 9.1% of the residual variability in office visit counts is attributable to systematic differences between insurance categories. The conditional R² rises from 0.170 (fixed effects only) to 0.300 once the random intercept is included, confirming that insurance status carries genuine grouping-level variance beyond what income, age, health status, education, and geography already account for.
+
+The AIC comparison, however, tells a more nuanced story. The GLMM (AIC = 119,843) is worse than the fixed-effect Negative Binomial model from Part 3 (AIC = 119,822). This means that treating insurance status as a random effect — with only three levels — is a less efficient parameterisation than including it as a fixed predictor with explicit, estimable coefficients. 
+
+
+## GLMM: Insurance Status as Random Effect (ER Visits)
+```{r glmm_ins_er, message=FALSE, warning=FALSE}
+
+theta_er <- model_nb_er$theta
+
+glmm_ins_er <- glmer(
+  er_visits ~ region + age_group + sex + race_eth + povcat +
+    n_chronic + poor_health + educ_cat + any_barrier +
+    (1 | ins_status),
+  family = MASS::negative.binomial(theta = theta_er),
+  data = meps_adults,
+  control = glmerControl(
+    optimizer = "bobyqa",
+    optCtrl = list(maxfun = 1e5)
+  )
+)
+
+summary(glmm_ins_er)
+```
+
+```{r glmm_ins_er_results, echo=FALSE}
+vc_ins_er   <- as.data.frame(lme4::VarCorr(glmm_ins_er))
+icc_ins_er  <- vc_ins_er$vcov[1] / (vc_ins_er$vcov[1] + (pi^2 / 3))
+
+cat("Random-effect variance (insurance status):", round(vc_ins_er$vcov[1], 4), "\n")
+cat("Intraclass Correlation (ICC):", round(icc_ins_er, 4), "\n\n")
+
+glmm_ins_er_tidy <- broom.mixed::tidy(glmm_ins_er, effects = "fixed",
+                                       exponentiate = TRUE, conf.int = TRUE) %>%
+  filter(term != "(Intercept)") %>%
+  rename(IRR = estimate, CI_low = conf.low, CI_high = conf.high)
+
+knitr::kable(
+  glmm_ins_er_tidy %>% dplyr::select(term, IRR, CI_low, CI_high, p.value),
+  digits  = 3,
+  caption = " Fixed-Effect IRRs ER Visits") %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  row_spec(which(glmm_ins_er_tidy$p.value < 0.05), bold = TRUE)
+
+r2_glmm_ins_er <- MuMIn::r.squaredGLMM(glmm_ins_er)
+cat("Marginal R²:   ", round(r2_glmm_ins_er[1, "R2m"], 4), "\n")
+cat("Conditional R²:", round(r2_glmm_ins_er[1, "R2c"], 4), "\n")
+cat("AIC NB fixed-effect model:", round(AIC(model_nb_er), 1), "\n")
+cat("AIC GLMM (insurance random): ", round(AIC(glmm_ins_er), 1), "\n")
+```
+
+For emergency department visits, the random-effect variance for insurance status is 0.0817, yielding an ICC of 0.024 — substantially lower than the office visit ICC (9.1%), consistent with the structural logic from Part 3: insurance status primarily gates entry into the ambulatory circuit, while emergency access is less contingent on coverage type.  
+The marginal and conditional R² differ by just 1.2 percentage points (0.058 and 0.070), and the GLMM (AIC = 23,751) is again worse than the fixed-effect NB model (AIC = 23,737) by 14 points. The fixed-effect IRRs replicate Part 3 with full stability.
+
+
+## GLMM Conclusion
+The four GLMMs converge on a consistent conclusion. Region adds negligible explanatory power: geographic disparities are compositional, driven by the concentration of uninsured and low-income individuals.  
+Insurance status generates substantially larger clustering, but with only three levels the fixed-effect specification remains more efficient, as both AIC comparisons confirm.  
+The structural disparities documented in this analysis are properties of individual circumstances, not of geography or institutional context.
+
+---
+
+# Conclusions
+Our analysis confirmed that barriers are real and measurable. 
+
+The Logistic Regression model revealed that being uninsured and belonging to lower income categories are among the strongest predictors of reported access barriers, suggesting that structural inequalities, not just individual health needs, shape whether people receive care.
+
+The Negative Binomial models, chosen to correct for the severe overdispersion present in both office and ER visit counts, further reinforced this picture: uninsured individuals make dramatically fewer office visits, while lower-income groups show higher ER utilization.
+
+The GLMMs added a complementary layer of insight. While insurance status as a random effect introduced modest but non-negligible between-group heterogeneity in office visits (ICC ≈ 9%), its contribution was smaller for ER visits (ICC ≈ 2%), suggesting that for emergency care, individual-level factors, particularly chronic disease burden and poor self-reported health, dominate over insurance clustering. Across all models, the number of chronic conditions and poor health status emerged as the most consistent and powerful drivers of utilization, confirming that unmet clinical need, when not filtered out by financial barriers, translates directly into healthcare demand.
+Geographic variation was also present, with the South and West consistently showing lower office visit rates compared to the Northeast, hinting at regional differences in care supply, cultural factors, or underlying health profiles that deserve further investigation.
+
+Taken together, our results paint a consistent picture: in the United States, healthcare access is not purely a function of clinical need. Insurance coverage and income act as gatekeeping mechanisms that redirect, or entirely suppress, utilization.
+
